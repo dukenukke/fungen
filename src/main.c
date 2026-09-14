@@ -225,6 +225,7 @@ void create_demo_ui(lv_display_t *disp) {
         is_calibrated = true;
         create_main_application_ui();
     } else {
+        is_calibrated = false;
         start_interactive_calibration(disp);
     }
 }
@@ -244,7 +245,7 @@ void app_main(void) {
         .mosi_io_num = CYD_PIN_TFT_MOSI,
         .miso_io_num = CYD_PIN_TFT_MISO,
         .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
+        .quadhd_io_num = -1, // Unused quad-SPI signal; touch IRQ is configured below.
         .max_transfer_sz = CYD_RES_H * 80 * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(CYD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
@@ -271,7 +272,6 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     
-    // --- ПОВТОРЕННЯ ВАШОГО ОФІЦІЙНОГО РОБОЧОГО КОДУ ІНІЦІАЛІЗАЦІЇ ---
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true)); 
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true)); 
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));
@@ -333,13 +333,16 @@ void app_main(void) {
         .x_max = CYD_RES_H,
         .y_max = CYD_RES_V,
         .rst_gpio_num = -1,
-        .int_gpio_num = -1,
-        .flags = {
-            .swap_xy = 1,   
-            .mirror_x = 0,  
-            .mirror_y = 0,  
+        .int_gpio_num = CYD_PIN_TOUCH_INT,
+        .levels = {
+            .interrupt = 0, // XPT2046 PENIRQ is active low.
         },
-        .process_coordinates = NULL,
+        .flags = {
+            .swap_xy = 0,
+            .mirror_x = 0,  
+            .mirror_y = 0, // Calibration supplies the complete display-coordinate mapping.
+        },
+        .process_coordinates = touch_coordinate_transformer,
     };
     ESP_ERROR_CHECK(esp_lcd_touch_new_spi_xpt2046(touch_io_handle, &touch_config, &touch_handle));
     lv_display_set_user_data(lvgl_disp, touch_handle); 
@@ -348,7 +351,8 @@ void app_main(void) {
         .disp = lvgl_disp,
         .handle = touch_handle,
     };
-    lvgl_port_add_touch(&touch_cfg);
+    lv_indev_t *touch_indev = lvgl_port_add_touch(&touch_cfg);
+    ESP_ERROR_CHECK(touch_indev ? ESP_OK : ESP_FAIL);
 
     // Чистий запуск Oneshot ЦАП під новий тулчейн
     dac_oneshot_config_t dac_cfg = {

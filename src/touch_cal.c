@@ -1,167 +1,233 @@
-#include "touch_cal.h"
+﻿#include "touch_cal.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_rom_crc.h"
 #include "cyd_pins.h"
+#include "sdkconfig.h"
+#include <stddef.h>
 #include <stdio.h>
+
+#if CONFIG_XPT2046_CONVERT_ADC_TO_COORDS
+#error "Touch calibration requires raw XPT2046 ADC coordinates"
+#endif
+
+#define CAL_VERSION 2
+#define CAL_MIN_SAMPLES 3
+#define CAL_MAX_SAMPLES 8
+#define CAL_SAMPLE_TOLERANCE 120
+#define CAL_MARGIN 40
 
 touch_calibration_data_t cal_data;
 bool is_calibrated = false;
 
-typedef enum { CAL_STATE_NONE = 0, CAL_STATE_TOP_LEFT, CAL_STATE_TOP_RIGHT, CAL_STATE_BOTTOM_LEFT, CAL_STATE_BOTTOM_RIGHT, CAL_STATE_DONE } cal_state_t;
-volatile cal_state_t calibration_state = CAL_STATE_NONE;
+/* All capture and UI work runs in the LVGL task under its port lock. */
+static int calibration_step = -1;
+static bool step_pending;
+static uint32_t sample_x, sample_y;
+static unsigned sample_count;
+static touch_cal_point_t captured[4];
+static const touch_cal_point_t targets[4] = {
+    {CAL_MARGIN, CAL_MARGIN},
+    {CYD_RES_H - 1 - CAL_MARGIN, CAL_MARGIN},
+    {CAL_MARGIN, CYD_RES_V - 1 - CAL_MARGIN},
+    {CYD_RES_H - 1 - CAL_MARGIN, CYD_RES_V - 1 - CAL_MARGIN},
+};
+static const char *instructions[4] = {
+    "Hold the Top-Left cross, then release",
+    "Hold the Top-Right cross, then release",
+    "Hold the Bottom-Left cross, then release",
+    "Hold the Bottom-Right cross, then release",
+};
+static lv_obj_t *cal_screen, *cal_cross, *cal_label;
 
-int32_t raw_x_accum[5] = {0};
-int32_t raw_y_accum[5] = {0};
+extern void create_main_application_ui(void);
 
-lv_obj_t *cal_screen = NULL;
-lv_obj_t *cal_cross = NULL;
-lv_obj_t *cal_label = NULL;
-
-void create_main_application_ui(void); // Связь с main.c
-
-static uint32_t calculate_cal_crc(touch_calibration_data_t *data) {
-    return esp_rom_crc32_le(0, (uint8_t const *)data, sizeof(touch_calibration_data_t) - sizeof(uint32_t));
+static uint32_t calculate_cal_crc(const touch_calibration_data_t *data) {
+    return esp_rom_crc32_le(0, (const uint8_t *)data, offsetof(touch_calibration_data_t, crc));
 }
 
 void init_nvs_calibration(void) {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
-        nvs_flash_init();
+        ret = nvs_flash_init();
     }
+    ESP_ERROR_CHECK(ret);
 }
 
 bool load_calibration_data(void) {
-    nvs_handle_t my_handle;
-    if (nvs_open("storage", NVS_READONLY, &my_handle) != ESP_OK) return false;
-    size_t required_size = sizeof(touch_calibration_data_t);
-    esp_err_t err = nvs_get_blob(my_handle, "touch_cal", &cal_data, &required_size);
-    nvs_close(my_handle);
-    if (err != ESP_OK || cal_data.crc != calculate_cal_crc(&cal_data)) return false;
+    nvs_handle_t handle;
+    if (nvs_open("storage", NVS_READONLY, &handle) != ESP_OK) return false;
+    touch_calibration_data_t saved = {0};
+    size_t size = sizeof(saved);
+    esp_err_t err = nvs_get_blob(handle, "touch_cal", &saved, &size);
+    nvs_close(handle);
+    /* Old min/max calibration cannot correct rotation; require a fresh four-point fit. */
+    if (err != ESP_OK || size != sizeof(saved) || saved.version != CAL_VERSION ||
+        saved.crc != calculate_cal_crc(&saved) || !touch_cal_mapping_valid(&saved.mapping)) return false;
+    cal_data = saved;
     return true;
 }
 
+void erase_calibration_data(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return;
+    err = nvs_erase_key(handle, "touch_cal");
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err == ESP_OK) printf("[CAL] Calibration data erased from NVS.\n");
+}
+
 static void save_calibration_data(void) {
+    cal_data.version = CAL_VERSION;
     cal_data.crc = calculate_cal_crc(&cal_data);
-    nvs_handle_t my_handle;
-    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
-        nvs_set_blob(my_handle, "touch_cal", &cal_data, sizeof(touch_calibration_data_t));
-        nvs_commit(my_handle);
-        nvs_close(my_handle);
-        printf("[CAL] Coefficients successfully saved to NVS.\n");
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(handle, "touch_cal", &cal_data, sizeof(cal_data));
+        if (err == ESP_OK) err = nvs_commit(handle);
+        nvs_close(handle);
     }
+    if (err == ESP_OK) printf("[CAL] Affine calibration saved to NVS.\n");
+    else printf("[CAL] NVS save failed: %s; calibration applies until reboot.\n", esp_err_to_name(err));
 }
 
-void touch_coordinate_transformer(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y, uint16_t *strength, uint8_t *point_num, uint8_t max_point_num) {
-    if (*point_num == 0) return;
-    
-    if (is_calibrated) {
-        int32_t raw_x = *x;
-        int32_t raw_y = *y;
-
-        int32_t calc_x = ((raw_x - cal_data.x_min) * CYD_RES_H) / (cal_data.x_max - cal_data.x_min);
-        int32_t calc_y = ((raw_y - cal_data.y_min) * CYD_RES_V) / (cal_data.y_max - cal_data.y_min);
-        
-        if (calc_x < 0) calc_x = 0;
-        if (calc_x > CYD_RES_H) calc_x = CYD_RES_H;
-        if (calc_y < 0) calc_y = 0;
-        if (calc_y > CYD_RES_V) calc_y = CYD_RES_V;
-        
-        *x = (uint16_t)calc_x; 
-        *y = (uint16_t)calc_y;
-    }
+static void reset_samples(void) {
+    sample_x = sample_y = sample_count = 0;
 }
 
-// --- БЕЗОПАСНЫЙ СИНХРОННЫЙ ТАЙМЕР LVGL (Убирает Deadlock) ---
-static void cal_timer_step_cb(lv_timer_t * timer) {
-    // Удаляем отработавший одноразовый таймер
-    lv_timer_delete(timer);
-
-    if (calibration_state == CAL_STATE_TOP_LEFT) {
-        calibration_state = CAL_STATE_TOP_RIGHT;
-        lv_obj_align(cal_cross, LV_ALIGN_TOP_RIGHT, -15, 15);
-        lv_label_set_text(cal_label, "Touch Top-Right Corner");
-        printf("[CAL UI] Advanced to step: Top-Right\n");
-    } else if (calibration_state == CAL_STATE_TOP_RIGHT) {
-        calibration_state = CAL_STATE_BOTTOM_LEFT;
-        lv_obj_align(cal_cross, LV_ALIGN_BOTTOM_LEFT, 15, -15);
-        lv_label_set_text(cal_label, "Touch Bottom-Left Corner");
-        printf("[CAL UI] Advanced to step: Bottom-Left\n");
-    } else if (calibration_state == CAL_STATE_BOTTOM_LEFT) {
-        calibration_state = CAL_STATE_BOTTOM_RIGHT;
-        lv_obj_align(cal_cross, LV_ALIGN_BOTTOM_RIGHT, -15, -15);
-        lv_label_set_text(cal_label, "Touch Bottom-Right Corner");
-        printf("[CAL UI] Advanced to step: Bottom-Right\n");
-    } else if (calibration_state == CAL_STATE_BOTTOM_RIGHT) {
-        calibration_state = CAL_STATE_DONE;
-
-        cal_data.x_min = (raw_x_accum[CAL_STATE_TOP_LEFT] + raw_x_accum[CAL_STATE_BOTTOM_LEFT]) / 2;
-        cal_data.x_max = (raw_x_accum[CAL_STATE_TOP_RIGHT] + raw_x_accum[CAL_STATE_BOTTOM_RIGHT]) / 2;
-        cal_data.y_min = (raw_y_accum[CAL_STATE_TOP_LEFT] + raw_y_accum[CAL_STATE_TOP_RIGHT]) / 2;
-        cal_data.y_max = (raw_y_accum[CAL_STATE_BOTTOM_LEFT] + raw_y_accum[CAL_STATE_BOTTOM_RIGHT]) / 2;
-
-        printf("[CAL MATH] Bounds calculated -> X_MIN: %ld, X_MAX: %ld | Y_MIN: %ld, Y_MAX: %ld\n", 
-                (long)cal_data.x_min, (long)cal_data.x_max, (long)cal_data.y_min, (long)cal_data.y_max);
-
-        save_calibration_data();
-        is_calibrated = true;
-        
-        lv_obj_delete(cal_screen);
-        calibration_state = CAL_STATE_NONE;
-        create_main_application_ui();
-    }
-}
-
-static void cal_button_click_cb(lv_event_t * e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    
-    if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
-        lv_indev_t * indev = lv_indev_active();
-        if (indev) {
-            lv_point_t pt;
-            lv_indev_get_point(indev, &pt);
-            
-            raw_x_accum[calibration_state] = pt.x;
-            raw_y_accum[calibration_state] = pt.y;
-            
-            printf("[CAL TOUCH] State: %d | Captured X: %ld, Y: %ld\n", calibration_state, (long)pt.x, (long)pt.y);
+void touch_coordinate_transformer(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y,
+                                  uint16_t *strength, uint8_t *point_num, uint8_t max_point_num) {
+    (void)tp;
+    (void)strength;
+    for (uint8_t i = 0; i < *point_num && i < max_point_num; ++i) {
+        if (is_calibrated) {
+            touch_cal_point_t p = touch_cal_map(&cal_data.mapping, (touch_cal_point_t){x[i], y[i]});
+            x[i] = (uint16_t)lroundf(fminf(CYD_RES_H - 1, fmaxf(0, p.x)));
+            y[i] = (uint16_t)lroundf(fminf(CYD_RES_V - 1, fmaxf(0, p.y)));
+        } else {
+            if (i == 0 && calibration_step >= 0 && calibration_step < 4 && !step_pending &&
+                sample_count < CAL_MAX_SAMPLES) {
+                /* Restart an unstable hold; freeze after eight samples to ignore lift-off drift. */
+                if (sample_count && (fabsf(x[i] - (float)sample_x / sample_count) > CAL_SAMPLE_TOLERANCE ||
+                                     fabsf(y[i] - (float)sample_y / sample_count) > CAL_SAMPLE_TOLERANCE)) {
+                    reset_samples();
+                }
+                sample_x += x[i];
+                sample_y += y[i];
+                ++sample_count;
+            }
+            /* Route every physical press to the full-screen capture surface.
+             * Raw ADC values must never participate in LVGL hit testing. */
+            x[i] = CYD_RES_H / 2;
+            y[i] = CYD_RES_V / 2;
         }
     }
+}
 
-    if (code != LV_EVENT_CLICKED) return;
+static void show_target(void) {
+    lv_obj_set_pos(cal_cross, (int32_t)targets[calibration_step].x - 15,
+                             (int32_t)targets[calibration_step].y - 15);
+    lv_label_set_text(cal_label, instructions[calibration_step]);
+    printf("[CAL UI] Step %d: tap displayed cross at (%d, %d).\n", calibration_step + 1,
+           (int)targets[calibration_step].x, (int)targets[calibration_step].y);
+}
 
-    printf("[CAL UI] Click verified for step: %d. Creating LVGL Timer...\n", calibration_state);
-    
-    // Вместо async_call запускаем встроенный таймер LVGL на 10 мс.
-    // Он гарантированно выполнится в контексте потока графики и сдвинет хрестик.
-    lv_timer_create(cal_timer_step_cb, 10, NULL);
+static void cal_timer_step_cb(lv_timer_t *timer) {
+    (void)timer;
+    reset_samples();
+    step_pending = false;
+    if (++calibration_step < 4) {
+        show_target();
+        return;
+    }
+    if (!touch_cal_fit(captured, targets, &cal_data.mapping)) {
+        printf("[CAL] Inconsistent points; restarting calibration.\n");
+        calibration_step = 0;
+        show_target();
+        lv_label_set_text(cal_label, "Calibration failed.\nHold the Top-Left cross, then release");
+        return;
+    }
+    printf("[CAL MATH] X = %.6f * rawX + %.6f * rawY + %.2f; "
+           "Y = %.6f * rawX + %.6f * rawY + %.2f\n",
+           cal_data.mapping.xx, cal_data.mapping.xy, cal_data.mapping.x_offset,
+           cal_data.mapping.yx, cal_data.mapping.yy, cal_data.mapping.y_offset);
+    save_calibration_data();
+    is_calibrated = true;
+    calibration_step = -1;
+    /* Switch away before deleting the old active screen. */
+    create_main_application_ui();
+    lv_obj_delete(cal_screen);
+    cal_screen = cal_cross = cal_label = NULL;
+}
+
+static void cal_release_cb(lv_event_t *event) {
+    (void)event;
+    if (step_pending || calibration_step < 0 || calibration_step >= 4) return;
+    if (sample_count < CAL_MIN_SAMPLES) {
+        reset_samples();
+        lv_label_set_text(cal_label, "Hold the displayed cross a little longer,\nthen release");
+        return;
+    }
+    captured[calibration_step] = (touch_cal_point_t) {
+        (float)sample_x / sample_count, (float)sample_y / sample_count,
+    };
+    printf("[CAL TOUCH] Step: %d | ADC X: %.1f, Y: %.1f | samples: %u\n",
+           calibration_step + 1, captured[calibration_step].x, captured[calibration_step].y, sample_count);
+    step_pending = true;
+    /* Defer screen changes until LVGL has finished dispatching this release. */
+    lv_timer_t *timer = lv_timer_create(cal_timer_step_cb, 10, NULL);
+    if (timer) {
+        lv_timer_set_repeat_count(timer, 1);
+    } else {
+        step_pending = false;
+        reset_samples();
+        lv_label_set_text(cal_label, "Unable to advance. Please tap again.");
+    }
 }
 
 void start_interactive_calibration(lv_display_t *disp) {
-    printf("[CAL] Starting interactive 4-point calibration UI...\n");
-    calibration_state = CAL_STATE_TOP_LEFT;
+    printf("[CAL] Starting raw ADC four-point calibration.\n");
+    (void)disp;
+    calibration_step = 0;
     is_calibrated = false;
-    
+    step_pending = false;
+    reset_samples();
+
     cal_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(cal_screen, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(cal_screen, 0, 0);
+    lv_obj_set_style_border_width(cal_screen, 0, 0);
+    lv_obj_remove_flag(cal_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cal_screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cal_screen, cal_release_cb, LV_EVENT_RELEASED, NULL);
 
     cal_label = lv_label_create(cal_screen);
-    lv_label_set_text(cal_label, "Touch Top-Left Corner");
+    lv_obj_set_width(cal_label, CYD_RES_H - 20);
+    lv_obj_set_style_text_align(cal_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(cal_label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_color(cal_label, lv_color_white(), 0);
+    lv_obj_remove_flag(cal_label, LV_OBJ_FLAG_CLICKABLE);
 
-    cal_cross = lv_button_create(cal_screen);
-    lv_obj_set_size(cal_cross, 70, 70); 
-    lv_obj_set_style_bg_color(cal_cross, lv_color_make(60, 0, 0), 0); 
-    lv_obj_set_style_bg_opa(cal_cross, LV_OPA_40, 0);
-    
-    lv_obj_t *cross_label = lv_label_create(cal_cross);
-    lv_label_set_text(cross_label, "+");
-    lv_obj_center(cross_label);
-    lv_obj_set_style_text_color(cross_label, lv_color_make(255, 0, 0), 0);
-
-    lv_obj_align(cal_cross, LV_ALIGN_TOP_LEFT, 10, 10);
-    lv_obj_add_event_cb(cal_cross, cal_button_click_cb, LV_EVENT_ALL, NULL);
+    cal_cross = lv_obj_create(cal_screen);
+    lv_obj_remove_style_all(cal_cross);
+    lv_obj_set_size(cal_cross, 31, 31);
+    lv_obj_remove_flag(cal_cross, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *horizontal = lv_obj_create(cal_cross);
+    lv_obj_remove_style_all(horizontal);
+    lv_obj_set_size(horizontal, 31, 1);
+    lv_obj_center(horizontal);
+    lv_obj_set_style_bg_color(horizontal, lv_color_hex(0xff4040), 0);
+    lv_obj_set_style_bg_opa(horizontal, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(horizontal, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *vertical = lv_obj_create(cal_cross);
+    lv_obj_remove_style_all(vertical);
+    lv_obj_set_size(vertical, 1, 31);
+    lv_obj_center(vertical);
+    lv_obj_set_style_bg_color(vertical, lv_color_hex(0xff4040), 0);
+    lv_obj_set_style_bg_opa(vertical, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(vertical, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    show_target();
     lv_screen_load(cal_screen);
 }

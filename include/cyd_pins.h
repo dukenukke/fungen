@@ -16,6 +16,7 @@
 #define CYD_PIN_TOUCH_MOSI   32   // MOSI з вашого фото
 #define CYD_PIN_TOUCH_MISO   39   // MISO з вашого фото
 #define CYD_PIN_TOUCH_CS     33   // Стандартний CS для двошинної плати
+#define CYD_PIN_TOUCH_INT    36   // INT з вашого фото
 
 #define CYD_RES_H            320
 #define CYD_RES_V            240
